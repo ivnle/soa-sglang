@@ -24,9 +24,12 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^condition_embedder\.time_proj\.(.*)$": r"condition_embedder.time_modulation.linear.\1",
             r"^condition_embedder\.image_embedder\.ff\.net\.0\.proj\.(.*)$": r"condition_embedder.image_embedder.ff.fc_in.\1",
             r"^condition_embedder\.image_embedder\.ff\.net\.2\.(.*)$": r"condition_embedder.image_embedder.ff.fc_out.\1",
-            r"^blocks\.(\d+)\.attn1\.to_q\.(.*)$": r"blocks.\1.to_q.\2",
-            r"^blocks\.(\d+)\.attn1\.to_k\.(.*)$": r"blocks.\1.to_k.\2",
-            r"^blocks\.(\d+)\.attn1\.to_v\.(.*)$": r"blocks.\1.to_v.\2",
+            # Fused QKV mapping for WanTransformerBlock
+            r"^blocks\.(\d+)\.attn1\.to_q\.(.*)$": r"blocks.\1.to_qkv.\2",
+            r"^blocks\.(\d+)\.attn1\.to_k\.(.*)$": r"blocks.\1.to_qkv.\2",
+            r"^blocks\.(\d+)\.attn1\.to_v\.(.*)$": r"blocks.\1.to_qkv.\2",
+            # Fused QKVG mapping for WanTransformerBlock_VSA (with gate_compress)
+            r"^blocks\.(\d+)\.attn1\.to_gate_compress\.(.*)$": r"blocks.\1.to_qkvg.\2",
             r"^blocks\.(\d+)\.attn1\.to_out\.0\.(.*)$": r"blocks.\1.to_out.\2",
             r"^blocks\.(\d+)\.attn1\.norm_q\.(.*)$": r"blocks.\1.norm_q.\2",
             r"^blocks\.(\d+)\.attn1\.norm_k\.(.*)$": r"blocks.\1.norm_k.\2",

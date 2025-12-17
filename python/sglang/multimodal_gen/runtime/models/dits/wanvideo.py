@@ -220,6 +220,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_added_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        # Double stream for parallel computation
+        self.alt_stream = None
+        if torch.cuda.is_available():
+            self.alt_stream = torch.cuda.Stream()
+
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -231,12 +236,30 @@ class WanI2VCrossAttention(WanSelfAttention):
         context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
-        q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
-        k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
-        v = self.to_v(context)[0].view(b, -1, n, d)
-        k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).view(b, -1, n, d)
-        v_img = self.add_v_proj(context_img)[0].view(b, -1, n, d)
+        # compute query, key, value with double stream optimization
+        if self.alt_stream is not None and torch.cuda.is_available():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+
+            # Main stream: compute q, k, v for text context
+            q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
+            k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
+            v = self.to_v(context)[0].view(b, -1, n, d)
+
+            # Alt stream: compute k_img, v_img for image context in parallel
+            with torch.cuda.stream(self.alt_stream):
+                k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).view(
+                    b, -1, n, d
+                )
+                v_img = self.add_v_proj(context_img)[0].view(b, -1, n, d)
+
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
+            k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
+            v = self.to_v(context)[0].view(b, -1, n, d)
+            k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).view(b, -1, n, d)
+            v_img = self.add_v_proj(context_img)[0].view(b, -1, n, d)
         img_x = self.attn(q, k_img, v_img)
         # compute attention
         x = self.attn(q, k, v)
@@ -267,9 +290,8 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        # Fused QKV projection for better performance
+        self.to_qkv = ReplicatedLinear(dim, dim * 3, bias=True)
 
         self.to_out = ReplicatedLinear(dim, dim, bias=True)
         self.attn1 = USPAttention(
@@ -337,6 +359,15 @@ class WanTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # Pre-create fixed tensors to avoid repeated allocation in forward
+        self.register_buffer("null_shift", torch.zeros(1), persistent=False)
+        self.register_buffer("null_scale", torch.zeros(1), persistent=False)
+
+        # Double stream for parallel computation
+        self.alt_stream = None
+        if torch.cuda.is_available():
+            self.alt_stream = torch.cuda.Stream()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -369,17 +400,29 @@ class WanTransformerBlock(nn.Module):
 
         assert shift_msa.dtype == torch.float32
 
-        # 1. Self-attention
+        # 1. Self-attention with fused QKV
         norm1 = self.norm1(hidden_states.float())
         norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
-            query = self.norm_q(query)
-        if self.norm_k is not None:
-            key = self.norm_k(key)
+        # Fused QKV projection
+        qkv, _ = self.to_qkv(norm_hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        # Parallel QK norm with double stream
+        if self.alt_stream is not None and torch.cuda.is_available():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            if self.norm_q is not None:
+                query = self.norm_q(query)
+            with torch.cuda.stream(self.alt_stream):
+                if self.norm_k is not None:
+                    key = self.norm_k(key)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            if self.norm_q is not None:
+                query = self.norm_q(query)
+            if self.norm_k is not None:
+                key = self.norm_k(key)
 
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
@@ -395,11 +438,9 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        # Use pre-created fixed tensors
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, self.null_shift, self.null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -442,10 +483,8 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
-        self.to_gate_compress = ReplicatedLinear(dim, dim, bias=True)
+        # Fused QKVG projection for VSA
+        self.to_qkvg = ReplicatedLinear(dim, dim * 4, bias=True)
 
         self.to_out = ReplicatedLinear(dim, dim, bias=True)
         self.attn1 = UlyssesAttention_VSA(
@@ -514,6 +553,15 @@ class WanTransformerBlock_VSA(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # Pre-create fixed tensors to avoid repeated allocation in forward
+        self.register_buffer("null_shift", torch.zeros(1), persistent=False)
+        self.register_buffer("null_scale", torch.zeros(1), persistent=False)
+
+        # Double stream for parallel computation
+        self.alt_stream = None
+        if torch.cuda.is_available():
+            self.alt_stream = torch.cuda.Stream()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -532,19 +580,30 @@ class WanTransformerBlock_VSA(nn.Module):
         )
         assert shift_msa.dtype == torch.float32
 
-        # 1. Self-attention
+        # 1. Self-attention with fused QKVG
         norm_hidden_states = (
             self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
         ).to(orig_dtype)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
-        gate_compress, _ = self.to_gate_compress(norm_hidden_states)
 
-        if self.norm_q is not None:
-            query = self.norm_q(query)
-        if self.norm_k is not None:
-            key = self.norm_k(key)
+        # Fused QKVG projection
+        qkvg, _ = self.to_qkvg(norm_hidden_states)
+        query, key, value, gate_compress = qkvg.chunk(4, dim=-1)
+
+        # Parallel QK norm with double stream
+        if self.alt_stream is not None and torch.cuda.is_available():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            if self.norm_q is not None:
+                query = self.norm_q(query)
+            with torch.cuda.stream(self.alt_stream):
+                if self.norm_k is not None:
+                    key = self.norm_k(key)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            if self.norm_q is not None:
+                query = self.norm_q(query)
+            if self.norm_k is not None:
+                key = self.norm_k(key)
 
         query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
@@ -564,9 +623,9 @@ class WanTransformerBlock_VSA(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros((1,), device=hidden_states.device)
+        # Use pre-created fixed tensors
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, self.null_shift, self.null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
