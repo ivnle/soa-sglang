@@ -48,9 +48,13 @@ SEMANTIC_TEST_SETS = [
 RELEVANCE_TEST_DATA = {
     "sample_query": "What is machine learning?",
     "sample_reference": [
-        {"body": "Machine learning is a branch of artificial intelligence that enables systems to learn from data."},
+        {
+            "body": "Machine learning is a branch of artificial intelligence that enables systems to learn from data."
+        },
         {"body": "The weather today is sunny with a high of 75 degrees."},
-        {"body": "Deep learning uses neural networks with multiple layers to model complex patterns."},
+        {
+            "body": "Deep learning uses neural networks with multiple layers to model complex patterns."
+        },
     ],
 }
 
@@ -78,7 +82,10 @@ def get_openai_embeddings(
 
 
 def get_hf_embeddings(texts: Union[str, List[str]], model_path: str) -> torch.Tensor:
-    """Get embeddings using HuggingFace transformers with mean pooling."""
+    """Get embeddings using HuggingFace transformers with mean pooling.
+
+    Note: Uses CPU to avoid CUDA OOM when SGLang worker is using GPU.
+    """
     from transformers import AutoModel, AutoTokenizer
 
     if isinstance(texts, str):
@@ -88,7 +95,8 @@ def get_hf_embeddings(texts: Union[str, List[str]], model_path: str) -> torch.Te
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Use CPU to avoid CUDA OOM (SGLang worker is using GPU)
+    device = "cpu"
     model = model.to(device)
 
     embeddings = []
@@ -107,7 +115,9 @@ def get_hf_embeddings(texts: Union[str, List[str]], model_path: str) -> torch.Te
             attention_mask = inputs["attention_mask"]
 
             # Mean pooling
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+            input_mask_expanded = (
+                attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+            )
             sum_embeddings = torch.sum(last_hidden * input_mask_expanded, dim=1)
             sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
             embedding = sum_embeddings / sum_mask
@@ -120,13 +130,17 @@ def get_hf_embeddings(texts: Union[str, List[str]], model_path: str) -> torch.Te
 
 
 def get_hf_st_embeddings(texts: Union[str, List[str]], model_path: str) -> np.ndarray:
-    """Get embeddings using sentence-transformers library."""
+    """Get embeddings using sentence-transformers library.
+
+    Note: Uses CPU to avoid CUDA OOM when SGLang worker is using GPU.
+    """
     from sentence_transformers import SentenceTransformer
 
     if isinstance(texts, str):
         texts = [texts]
 
-    model = SentenceTransformer(model_path, trust_remote_code=True)
+    # Use CPU to avoid CUDA OOM (SGLang worker is using GPU)
+    model = SentenceTransformer(model_path, trust_remote_code=True, device="cpu")
     embeddings = model.encode(texts, normalize_embeddings=True)
     return embeddings
 
@@ -189,7 +203,11 @@ class TestEmbeddingCorrectness(CustomTestCase):
             logging.info(f"Processing semantic similarity test set {i + 1}")
 
             embedding_openai = get_openai_embeddings(input_texts, self.config)
-            embedding_hf = get_hf_embeddings(input_texts, self.config["model_path"]).detach().tolist()
+            embedding_hf = (
+                get_hf_embeddings(input_texts, self.config["model_path"])
+                .detach()
+                .tolist()
+            )
 
             logging.info(f'Comparing {self.config["server_engine"]} and HF embeddings')
             similarities = compare_embeddings(embedding_openai, embedding_hf)
@@ -199,16 +217,16 @@ class TestEmbeddingCorrectness(CustomTestCase):
             # Verify similarities
             for sim in similarities:
                 self.assertLess(
-                    abs(sim - 1.0),
-                    tolerance,
-                    f"Similarity {sim} is not close to 1"
+                    abs(sim - 1.0), tolerance, f"Similarity {sim} is not close to 1"
                 )
 
             logging.info(f"Semantic similarity test set {i + 1} passed\n")
 
     def test_relevance_scores(self, tolerance: float = 5e-2):
         """Compare relevance scores between gateway and HF implementations."""
-        logging.info(f'Comparing relevance scores between {self.config["server_engine"]} and HF')
+        logging.info(
+            f'Comparing relevance scores between {self.config["server_engine"]} and HF'
+        )
 
         # Format query with instruction (for e5-mistral)
         query = f"Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: {RELEVANCE_TEST_DATA['sample_query']}"
@@ -226,12 +244,14 @@ class TestEmbeddingCorrectness(CustomTestCase):
         docs_embeddings_hf = get_hf_st_embeddings(docs, self.config["model_path"])
         scores_hf = (query_embeddings_hf @ docs_embeddings_hf.T) * 100
 
-        logging.info(f'{self.config["server_engine"]} relevance scores: {scores_openai}')
+        logging.info(
+            f'{self.config["server_engine"]} relevance scores: {scores_openai}'
+        )
         logging.info(f"HF relevance scores: {scores_hf}")
 
         self.assertTrue(
             np.allclose(scores_openai, scores_hf, atol=tolerance),
-            f'Scores differ beyond tolerance: \n{self.config["server_engine"]}: {scores_openai}\nHF: {scores_hf}'
+            f'Scores differ beyond tolerance: \n{self.config["server_engine"]}: {scores_openai}\nHF: {scores_hf}',
         )
 
         logging.info("Relevance scores comparison completed successfully")
