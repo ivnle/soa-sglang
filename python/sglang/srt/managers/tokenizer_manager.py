@@ -1839,6 +1839,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             obj.sampling_params.get("json_schema", None)
             or obj.sampling_params.get("regex", None)
             or obj.sampling_params.get("ebnf", None)
+            or obj.sampling_params.get("lark", None)
             or obj.sampling_params.get("structural_tag", None)
         )
 

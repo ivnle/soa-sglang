@@ -151,6 +151,9 @@ class BaseGrammarBackend:
     def dispatch_ebnf(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("ebnf", key_string)
 
+    def dispatch_lark(self, key_string: str) -> Optional[BaseGrammarObject]:
+        return self._not_supported("lark", key_string)
+
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
@@ -165,6 +168,8 @@ class BaseGrammarBackend:
             grammar = self.dispatch_regex(key_string)
         elif key_type == "ebnf":
             grammar = self.dispatch_ebnf(key_string)
+        elif key_type == "lark":
+            grammar = self.dispatch_lark(key_string)
         elif key_type == "structural_tag":
             grammar = self.dispatch_structural_tag(key_string)
         elif key_type == "structural_pattern":

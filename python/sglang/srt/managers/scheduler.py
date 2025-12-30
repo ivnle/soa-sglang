@@ -1551,10 +1551,11 @@ class Scheduler(
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
+            or req.sampling_params.lark is not None
             or req.sampling_params.structural_tag is not None
         ):
             if self.grammar_backend is None:
-                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, lark, structural_tag) is not supported when the server is launched with --grammar-backend none"
                 req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:
@@ -1563,6 +1564,8 @@ class Scheduler(
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
                     key = ("ebnf", req.sampling_params.ebnf)
+                elif req.sampling_params.lark is not None:
+                    key = ("lark", req.sampling_params.lark)
                 elif req.sampling_params.structural_tag:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 

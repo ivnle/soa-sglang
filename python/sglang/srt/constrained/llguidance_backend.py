@@ -158,6 +158,14 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
+    def dispatch_lark(self, key_string: str) -> Optional[GuidanceGrammar]:
+        try:
+            serialized_grammar = grammar_from("lark", key_string)
+            return self._from_serialized(serialized_grammar)
+        except ValueError as e:
+            logger.error(f"Hit invalid lark grammar: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
             structural_tag = json.loads(key_string)

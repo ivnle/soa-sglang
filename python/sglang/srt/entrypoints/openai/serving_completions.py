@@ -146,6 +146,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "regex": request.regex,
             "json_schema": request.json_schema,
             "ebnf": request.ebnf,
+            "lark": request.lark,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
